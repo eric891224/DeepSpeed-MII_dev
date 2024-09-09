@@ -11,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass
 from collections import deque, defaultdict
-from functools import cached_property
+from functools import cached_property, reduce
 from typing import Dict, Tuple, List, Any, Union, DefaultDict
 
 import torch
@@ -20,11 +20,24 @@ import zmq
 from deepspeed.accelerator import get_accelerator
 from deepspeed.utils.timer import SynchronizedWallClockTimer
 
-from mii.batching.constants import TOP_K_NAME, TOP_P_NAME, TEMP_NAME, SAMPLER_NAME, STOP_NAME
+from mii.batching.constants import (
+    TOP_K_NAME,
+    TOP_P_NAME,
+    TEMP_NAME,
+    SAMPLER_NAME,
+    STOP_NAME,
+)
 from mii.batching.data_classes import Response, Request, RequestBatch
-from mii.batching.generation.logit_processors import TopPLogitProcessor, TopKLogitProcessor, TemperatureLogitProcessor
+from mii.batching.generation.logit_processors import (
+    TopPLogitProcessor,
+    TopKLogitProcessor,
+    TemperatureLogitProcessor,
+)
 from mii.batching.generation.samplers import LogitsSampler, GreedySampler
-from mii.batching.generation.stop_criterion import EosGenerationStopCriterion, TokenStopCriterion
+from mii.batching.generation.stop_criterion import (
+    EosGenerationStopCriterion,
+    TokenStopCriterion,
+)
 from mii.batching.postprocess import (
     run_batch_logit_processing,
     run_batch_sampler,
@@ -50,7 +63,9 @@ class RaggedBatchBase:
         if model_config.max_length is not None:
             self.max_length = model_config.max_length
         else:
-            self.max_length = inference_engine._policy._checkpoint_engine.model_config.max_seq_length
+            self.max_length = (
+                inference_engine._policy._checkpoint_engine.model_config.max_seq_length
+            )
         self.sync_debug = model_config.sync_debug
         self.profile_model_time = model_config.profile_model_time
 
@@ -105,6 +120,11 @@ class RaggedBatchBase:
         """
         This is the main loop of FastGen: puts requests and gets generated results.
         """
+        # if self._iters == 1:
+        #     self._timers("evaluation").start()
+        #     torch.cuda.nvtx.range_push("Evaluation")
+        # elif self._iters > 1:
+        #     torch.cuda.nvtx.range_push("Generation")
 
         # 1. Get a batch of requests, broadcast to all ranks
         scheduled_requests, force = self._bcast_requests()
@@ -150,19 +170,46 @@ class RaggedBatchBase:
         self.scheduled_requests.prune(running_requests.completed.uids)
         self.schedule_requests()
 
+        # if self._iters == 1:
+        #     self._timers("evaluation").stop()
+        #     self._profiled_times["evaluation"].append(
+        #         self._timers("evaluation").elapsed(reset=True)
+        #     )
+        #     torch.cuda.nvtx.range_pop()
+        # elif self._iters > 1:
+        #     torch.cuda.nvtx.range_pop()
+
         if self.profile_model_time:
             self._print_profiled_times()
 
     def _print_profiled_times(self) -> None:
+        # calculate eval tokens at _iters == 0
+        if self._iters == 0:
+            self._num_eval_tokens = 0
+            for r in self.scheduled_requests:
+                self._num_eval_tokens += r.prompt_length
+
         self._iters += 1
+
         if not (self._iters % 100 == 0):
             return
+
         for event, times in self._profiled_times.items():
             mean_time = sum(times) / len(times)
-            log_msg = f"{event}: {mean_time}"
+            log_msg = f"{event}: {mean_time}\n"
+            if event == "evaluate":
+                log_msg += f"#Eval Tokens: {self._num_eval_tokens}\n"
+                log_msg += f" ({self._num_eval_tokens / sum(times) * 1000} tokens/s)\n"
+                # log_msg += f"DEBUG timer: {self._profiled_times.items()}"
             if event == "generate":
-                log_msg += f" ({self._num_generated_tokens / sum(times)} tokens/ms)"
+                log_msg += f"#Gen Tokens: {self._num_generated_tokens}\n"
+                log_msg += (
+                    f" ({self._num_generated_tokens / sum(times) * 1000} tokens/s)\n"
+                )
+                # log_msg += f"DEBUG timer: {self._profiled_times.items()}"
+
             logger.info(log_msg)
+
         self._profiled_times.clear()
         self._num_generated_tokens = 0
 
@@ -198,22 +245,20 @@ class RaggedBatchBase:
 
     @sync_debug
     def _process_logits(
-            self,
-            next_token_logits: torch.Tensor,
-            running_requests: RequestBatch) -> Tuple[torch.Tensor,
-                                                     torch.Tensor]:
+        self, next_token_logits: torch.Tensor, running_requests: RequestBatch
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Process generated logits, run post processing, gets next token, and
         # checks for stop criteria at each round of generation for all requests.
-        next_token_logits = next_token_logits[:, :self.vocab_size]
-        next_token_logits = self.logit_processor(next_token_logits,
-                                                 running_requests,
-                                                 self._post_processors)
-        next_tokens = self.sampler(next_token_logits,
-                                   running_requests,
-                                   self._post_processors)
-        done_tokens = self.stop_criterion(next_tokens,
-                                          running_requests,
-                                          self._post_processors)
+        next_token_logits = next_token_logits[:, : self.vocab_size]
+        next_token_logits = self.logit_processor(
+            next_token_logits, running_requests, self._post_processors
+        )
+        next_tokens = self.sampler(
+            next_token_logits, running_requests, self._post_processors
+        )
+        done_tokens = self.stop_criterion(
+            next_tokens, running_requests, self._post_processors
+        )
         next_tokens = next_tokens.to(torch.device("cpu"), non_blocking=False)
         done_tokens = done_tokens.to(torch.device("cpu"), non_blocking=False)
         return next_tokens, done_tokens
@@ -225,31 +270,36 @@ class RaggedBatchBase:
         # this happens only when a stop criteria is met.
         outputs = []
         if r.stream:
-            outputs.append((
-                r.uid,
-                [r.next_token],
-                r.prompt_length,
-                r.num_generated_tokens,
-                GenerationFinishReason.NONE,
-                r.stream,
-            ))
+            outputs.append(
+                (
+                    r.uid,
+                    [r.next_token],
+                    r.prompt_length,
+                    r.num_generated_tokens,
+                    GenerationFinishReason.NONE,
+                    r.stream,
+                )
+            )
         if r.finish_reason != GenerationFinishReason.NONE:
             if r.stream or not r.generated_tokens:
                 output_tokens = []
             else:
-                output_tokens = torch.cat([t.unsqueeze(0) for t in r.generated_tokens],
-                                          dim=0)
+                output_tokens = torch.cat(
+                    [t.unsqueeze(0) for t in r.generated_tokens], dim=0
+                )
                 if r.return_full_text:
                     # Avoid returning bos token, refactor this later
                     output_tokens = torch.cat((r.prompt_tokens[1:], output_tokens))
-            outputs.append((
-                r.uid,
-                output_tokens,
-                r.prompt_length,
-                r.num_generated_tokens,
-                r.finish_reason,
-                r.stream,
-            ))
+            outputs.append(
+                (
+                    r.uid,
+                    output_tokens,
+                    r.prompt_length,
+                    r.num_generated_tokens,
+                    r.finish_reason,
+                    r.stream,
+                )
+            )
         for output in outputs:
             self.result_queues[r.tid].put_nowait(output)
 
@@ -257,11 +307,13 @@ class RaggedBatchBase:
         free_blocks = min(self.inference_engine.free_blocks)
         conf_manager = self.inference_engine._config.state_manager
 
-        num_schedulable = min([
-            len(requests),
-            conf_manager.max_ragged_sequence_count,
-            conf_manager.max_ragged_batch_size
-        ])
+        num_schedulable = min(
+            [
+                len(requests),
+                conf_manager.max_ragged_sequence_count,
+                conf_manager.max_ragged_batch_size,
+            ]
+        )
 
         for r in requests[:num_schedulable]:
             block_capacity = self.inference_engine.get_remaining_block_capacity(r.uid)
@@ -288,8 +340,10 @@ class RaggedBatchBase:
                 continue
 
             # Make sure that the engine has enough capacity to process the batch
-            if len(self.scheduled_requests.requests_to_run
-                   ) >= conf_manager.max_ragged_sequence_count:
+            if (
+                len(self.scheduled_requests.requests_to_run)
+                >= conf_manager.max_ragged_sequence_count
+            ):
                 break
 
             max_batch_size = conf_manager.max_ragged_batch_size - self.scheduled_length
@@ -302,12 +356,16 @@ class RaggedBatchBase:
                 # When the KV cache is out of capacity, we release KV cache blocks for a request.
                 # However, we can immediately schedule the request again if we split the request.
                 # So we make sure that we have capacity for the entire prompt (+tokens already generated).
-                req_tokens, _ = self.inference_engine.query(r.uid, len(r.input_tokens), max_blocks)
+                req_tokens, _ = self.inference_engine.query(
+                    r.uid, len(r.input_tokens), max_blocks
+                )
                 if req_tokens < len(r.input_tokens):
                     break
 
             req_tokens = min(len(r.input_tokens), max_batch_size)
-            req_tokens, req_blocks = self.inference_engine.query(r.uid, req_tokens, max_blocks)
+            req_tokens, req_blocks = self.inference_engine.query(
+                r.uid, req_tokens, max_blocks
+            )
 
             if req_tokens <= 0:
                 continue
@@ -360,7 +418,8 @@ class RaggedBatchBase:
         else:
             scheduled_requests_ids = set(id(r) for r in self.scheduled_requests)
             self.buffer = deque(
-                [r for r in self.buffer if id(r) not in scheduled_requests_ids])
+                [r for r in self.buffer if id(r) not in scheduled_requests_ids]
+            )
 
     def _queue_flush_request(self, uid: int) -> None:
         self.request_queue.put_nowait(
@@ -373,7 +432,8 @@ class RaggedBatchBase:
                 last_in_prompt=None,
                 post_processing=None,
                 generate_params=None,
-            ))
+            )
+        )
 
     def reset_request_status(self):
         ## Get the last request that consumes KV cache
@@ -381,7 +441,9 @@ class RaggedBatchBase:
         for r in self.buffer:
             if r.seq_length > 0:
                 last_r = r
-        assert last_r is not None, "Function to clear the KV cache is invoked, but no request consumes KV cache"
+        assert (
+            last_r is not None
+        ), "Function to clear the KV cache is invoked, but no request consumes KV cache"
 
         ## Schedule flushing r
         self.scheduled_requests.append(
@@ -394,12 +456,14 @@ class RaggedBatchBase:
                 last_in_prompt=None,
                 post_processing=None,
                 generate_params=None,
-            ))
+            )
+        )
 
         ## Rebuild the request
         new_req = copy.copy(last_r)
         new_req.prompt_tokens = new_req.input_tokens = torch.concat(
-            [last_r.prompt_tokens] + [t.unsqueeze(0) for t in last_r.generated_tokens])
+            [last_r.prompt_tokens] + [t.unsqueeze(0) for t in last_r.generated_tokens]
+        )
         new_req.seq_length = 0
         new_req.max_new_tokens = last_r.max_new_tokens - len(last_r.generated_tokens)
         new_req.clear_generated_token()
@@ -417,11 +481,9 @@ class RaggedBatchBase:
         new_buffer.append(new_req)
         self.buffer = new_buffer
 
-    def make_request(self,
-                     tid: int,
-                     uid: int,
-                     input_tokens: torch.Tensor,
-                     kwargs: Dict) -> Request:
+    def make_request(
+        self, tid: int, uid: int, input_tokens: torch.Tensor, kwargs: Dict
+    ) -> Request:
         kwargs["prompt_length"] = len(input_tokens)
         kwargs["max_length"] = kwargs.get("max_length", self.max_length)
         generate_params = GenerateParamsConfig(**kwargs)
@@ -446,7 +508,8 @@ class RaggedBatchBase:
             temp_name = "_".join((TEMP_NAME, str(temp)))
             if temp_name not in self._post_processors:
                 self._post_processors[temp_name] = TemperatureLogitProcessor(
-                    temperature=temp)
+                    temperature=temp
+                )
             post_processing.append(temp_name)
 
         do_sample = generate_params.do_sample
@@ -463,17 +526,18 @@ class RaggedBatchBase:
         stop = generate_params.stop
         if stop != []:
             for each_stop in stop:
-                stop_name = STOP_NAME + '_' + each_stop
+                stop_name = STOP_NAME + "_" + each_stop
                 if stop_name not in self._post_processors:
                     self._post_processors[stop_name] = TokenStopCriterion(
-                        token=each_stop,
-                        tokenizer=self.tokenizer)
+                        token=each_stop, tokenizer=self.tokenizer
+                    )
                 post_processing.append(stop_name)
         else:
             stop_name = STOP_NAME
             if STOP_NAME not in self._post_processors:
                 self._post_processors[stop_name] = EosGenerationStopCriterion(
-                    tokenizer=self.tokenizer)
+                    tokenizer=self.tokenizer
+                )
             post_processing.append(stop_name)
 
         return Request(
@@ -487,15 +551,19 @@ class RaggedBatchBase:
             generate_params=generate_params,
         )
 
-    def make_response(self,
-                      generated_text: str,
-                      prompt_length: int,
-                      generated_length: int,
-                      finish_reason: GenerationFinishReason) -> Response:
-        return Response(generated_text=generated_text,
-                        prompt_length=prompt_length,
-                        generated_length=generated_length,
-                        finish_reason=finish_reason)
+    def make_response(
+        self,
+        generated_text: str,
+        prompt_length: int,
+        generated_length: int,
+        finish_reason: GenerationFinishReason,
+    ) -> Response:
+        return Response(
+            generated_text=generated_text,
+            prompt_length=prompt_length,
+            generated_length=generated_length,
+            finish_reason=finish_reason,
+        )
 
     def put(self, uids: List[int], tokenized_input: List[torch.Tensor]) -> torch.Tensor:
         # Call inference engine. You can skip checking schedulability because we already checked when scheduling
@@ -541,8 +609,8 @@ class ReadableStream:
                 continue
 
             if state.prev_token_size > 0:
-                prev_token = state.token_ids[:state.prev_token_size]
-                state.token_ids = state.token_ids[state.prev_token_size:]
+                prev_token = state.token_ids[: state.prev_token_size]
+                state.token_ids = state.token_ids[state.prev_token_size :]
                 decoded = decoded.replace(self.tokenizer.decode(prev_token), "", 1)
 
             output.append(decoded)
@@ -557,6 +625,7 @@ class MIIPipeline(RaggedBatchBase):
     functionality of ragged batching and dynamic splitfuse. This class is
     returned from :func:`mii.pipeline`.
     """
+
     def __init__(self, all_rank_output: bool = False, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.tid = threading.get_ident()
@@ -564,10 +633,9 @@ class MIIPipeline(RaggedBatchBase):
         self._destroyed = False
         get_accelerator().set_device(int(os.getenv("LOCAL_RANK", "0")))
 
-    def __call__(self,
-                 prompts: Union[str,
-                                List[str]],
-                 **generate_kwargs) -> List[Response]:
+    def __call__(
+        self, prompts: Union[str, List[str]], **generate_kwargs
+    ) -> List[Response]:
         """
         Generates text for the given prompts
 
@@ -577,10 +645,11 @@ class MIIPipeline(RaggedBatchBase):
 
         :return: A list of :class:`Response` objects containing the generated
             text for all prompts.
-        """ # noqa: W605
+        """  # noqa: W605
         if self._destroyed:
             raise RuntimeError(
-                "The inference engine of this pipeline has been destroyed.")
+                "The inference engine of this pipeline has been destroyed."
+            )
 
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -614,10 +683,10 @@ class MIIPipeline(RaggedBatchBase):
                 exit = self.generate()
 
         outputs = [
-            r for idx,
-            r in sorted(zip(uids_complete_order,
-                            outputs),
-                        key=lambda pair: pair[0])
+            r
+            for idx, r in sorted(
+                zip(uids_complete_order, outputs), key=lambda pair: pair[0]
+            )
         ]
 
         if self._all_rank_output:
@@ -676,8 +745,11 @@ class MIIAsyncPipeline(RaggedBatchBase):
         while True:
             self.generate()
 
-            if (self.stop_thread and self.request_queue.empty()
-                    and all(q.empty() for q in self.result_queues.values())):
+            if (
+                self.stop_thread
+                and self.request_queue.empty()
+                and all(q.empty() for q in self.result_queues.values())
+            ):
                 break
 
     def _get_uid(self) -> int:
@@ -695,7 +767,7 @@ class MIIAsyncPipeline(RaggedBatchBase):
         # TODO: We should avoid any request/response work with non-rank 0, but
         # this requires some refactoring how we do the put and request in
         # `ModelResponse`
-        #if not self.is_rank_0:
+        # if not self.is_rank_0:
         #    return
         if self.stop_thread:
             raise RuntimeError("The request queue was shutdown.")
@@ -730,12 +802,21 @@ class MIIAsyncPipeline(RaggedBatchBase):
         # this requires some refactoring how we do the put and request in
         # `ModelResponse`
         if not self.is_rank_0:
-            return -1, Response(generated_text="",
-                            prompt_length=None,
-                            generated_length=None,
-                            finish_reason=None)
+            return -1, Response(
+                generated_text="",
+                prompt_length=None,
+                generated_length=None,
+                finish_reason=None,
+            )
         tid = threading.get_ident()
-        uid, generated_token_ids, prompt_length, generated_length, finish_reason, streaming = self.result_queues[tid].get()
+        (
+            uid,
+            generated_token_ids,
+            prompt_length,
+            generated_length,
+            finish_reason,
+            streaming,
+        ) = self.result_queues[tid].get()
 
         if len(generated_token_ids) == 0:
             generated_text = ""

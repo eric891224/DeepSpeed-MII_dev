@@ -1,6 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
+# PASLAB
+import torch
+
 # DeepSpeed Team
 from functools import wraps
 
@@ -30,11 +33,31 @@ def profiler(func):
         if not self.profile_model_time:
             return func(self, *args, **kwargs)
 
-        self._timers(func.__name__).start()
+        # unknown bubble
+        if self._iters == 0:
+            return func(self, *args, **kwargs)
+
+        # evaluation
+        elif self._iters == 1:
+            stage = "evaluate"
+            torch.cuda.nvtx.range_push("Evaluation")
+        # generation
+        else:
+            stage = "generate"
+            torch.cuda.nvtx.range_push("Generation")
+
+        self._timers(stage).start()
+        # self._timers(func.__name__).start()
         result = func(self, *args, **kwargs)
-        self._timers(func.__name__).stop()
-        self._profiled_times[func.__name__].append(
-            self._timers(func.__name__).elapsed(reset=True))
+        # self._timers(func.__name__).stop()
+        self._timers(stage).stop()
+        torch.cuda.nvtx.range_pop()
+
+        self._profiled_times[stage].append(self._timers(stage).elapsed(reset=True))
+
+        # self._profiled_times[func.__name__].append(
+        #     self._timers(func.__name__).elapsed(reset=True)
+        # )
         return result
 
     return wrapper
